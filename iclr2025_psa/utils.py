@@ -37,12 +37,81 @@ EOS_TOKEN = "</s>"
 # Note: No EOS token is used in original codebase
 prompt_template = f"{BOS_TOKEN} {B_INST} \n{B_SYS}{SYS_PROMPT}{E_SYS}\n\n {{question}} {E_INST} {{answer}}"
 
+# Llama-3 chat format (<|begin_of_text|><|start_header_id|>...<|end_header_id|> ... <|eot_id|>).
+# The Llama-2 `prompt_template` above is NOT valid for Llama-3, so Llama-3 goes through
+# tokenizer.apply_chat_template, like the qwen/gemma branches below.
+LLAMA3_END_TOKEN = '<|eot_id|>'
+# The Llama-3 chat template already emits <|begin_of_text|> at the start of the string, and every
+# consumer of these strings tokenizes with add_special_tokens=True (steering_vectors'
+# _extract_activations does `tokenizer(prompts, padding=True)`; get_text_probs / generate_text
+# below do `tokenizer(input, ...)`), which prepends a second BOS. Stripping the template's copy
+# leaves exactly one BOS in the tokenized input. Set to False to keep the raw template output.
+LLAMA3_STRIP_TEMPLATE_BOS = True
+
 MWEData = list[dict[str, str]]
+
+
+def is_llama3_tokenizer(tokenizer) -> bool:
+    name = tokenizer.name_or_path.lower()
+    return 'llama-3' in name or 'llama3' in name
+
+
+def _format_llama3(tokenizer, question: str, answer: str) -> str:
+    """ Llama-3 prompt ending exactly in `answer` (e.g. "(A)"), with no closing <|eot_id|> """
+    text = tokenizer.apply_chat_template([
+        {'role': 'system', 'content': SYS_PROMPT},
+        {'role': 'user', 'content': question},
+        {'role': 'assistant', 'content': answer}
+    ], tokenize=False, add_generation_prompt=False)
+    idx = text.rfind(LLAMA3_END_TOKEN)
+    assert idx != -1, f"Llama-3 chat template output has no {LLAMA3_END_TOKEN!r}: {text[-80:]!r}"
+    text = text[:idx]
+    if LLAMA3_STRIP_TEMPLATE_BOS and tokenizer.bos_token and text.startswith(tokenizer.bos_token):
+        text = text[len(tokenizer.bos_token):]
+    # Answers are "(A)" / "(B)" (survival-instinct also has "(C)".."(H)"); the template trims
+    # the assistant content, so the string must end exactly in the answer letter + ')'.
+    assert len(answer) == 3 and answer[0] == '(' and answer[2] == ')' and answer[1].isupper(), \
+        f"unexpected answer format {answer!r}"
+    assert text.endswith(answer), \
+        f"Llama-3 prompt must end exactly in {answer!r}, got tail {text[-40:]!r}"
+    return text
+
+
+def diagnose_read_token_index(prompt: str, tokenizer, read_token_index: int = -2,
+                              expected_letter: str | None = None, label: str = '') -> bool:
+    """ Prints the last tokens of `prompt` and checks that the token at `read_token_index`
+    contains the answer letter (A/B by default). Returns False if it does not, which means
+    `read_token_index` must be adjusted for this tokenizer. """
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    print(f"--- read-token diagnostic {label}(read_token_index={read_token_index}, "
+          f"{len(ids)} tokens without special tokens) ---")
+    for i in [-4, -3, -2, -1]:
+        print(i, ids[i], repr(tokenizer.decode([ids[i]])))
+    # How the library actually tokenizes it (add_special_tokens=True): show the head to make
+    # a double BOS visible.
+    lib_ids = tokenizer(prompt)['input_ids']
+    head = [(t, tokenizer.decode([t])) for t in lib_ids[:3]]
+    print(f"head as tokenized by steering_vectors (add_special_tokens=True): {head}")
+    if tokenizer.bos_token_id is not None and lib_ids[:2] == [tokenizer.bos_token_id] * 2:
+        print("WARNING: the tokenized input starts with TWO BOS tokens.")
+    tok = tokenizer.decode([ids[read_token_index]])
+    letters = [expected_letter] if expected_letter else ['A', 'B']
+    ok = any(letter in tok for letter in letters)
+    if ok:
+        print(f"OK: token at index {read_token_index} is {tok!r}, it contains the answer letter.")
+    else:
+        print(f"WARNING: token at index {read_token_index} is {tok!r}, which does NOT contain "
+              f"{'/'.join(letters)}. read_token_index must be adjusted for this tokenizer.")
+    return ok
 
 
 def make_pos_neg_pair(mwe_data: MWEData, tokenizer) -> tuple[str, str]:
     """ Creates a (positive, negative) pair for getting contrastive activations """
-    if 'llama' in tokenizer.name_or_path.lower() or 'mistral' in tokenizer.name_or_path.lower():
+    if is_llama3_tokenizer(tokenizer):
+        # Must come before the generic 'llama' check: Llama-3 names also contain 'llama'.
+        pos = _format_llama3(tokenizer, mwe_data['question'], mwe_data['answer_matching_behavior'])
+        neg = _format_llama3(tokenizer, mwe_data['question'], mwe_data['answer_not_matching_behavior'])
+    elif 'llama' in tokenizer.name_or_path.lower() or 'mistral' in tokenizer.name_or_path.lower():
         pos = prompt_template.format(
             question = mwe_data['question'],
             answer = mwe_data['answer_matching_behavior']   
