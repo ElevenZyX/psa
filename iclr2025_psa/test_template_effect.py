@@ -15,17 +15,12 @@ Inputs
   --rbar-csv      measure_rbar.py output, mandatory cross-check that the cache is what was measured
 
 Step 0 — index alignment (the only place this analysis can go silently wrong)
-  The cached rows are NOT in json order: measure_rbar.load_pairs (measure_rbar.py:129-139, also used
-  by sweep_epsilon.extract_diffs at sweep_epsilon.py:170) does
-        data = json.load(...); random.Random(seed).shuffle(data); data[:n_samples]
-  and steering_vectors.extract_activations keeps that order (batchify yields data[i:i+batch_size]
-  sequentially, utils.py:9-23; torch.concat(pos_acts[layer]) concatenates in call order,
-  sweep_epsilon.py:203-207). random.shuffle only calls randbelow(i+1) for i = len-1 .. 1, so it depends
-  on len(data) and the seed only: shuffling range(total) with the same seed reproduces the permutation
-  exactly. The mapping is then verified independently: the cache stores the formatted prompt of the
-  first shuffled pair (example_pos / example_neg), which must contain the question of json[perm[0]]
-  and no other question, and must end in that pair's answer letters. R̄ recomputed from the cache with
-  measure_rbar's float32 arithmetic must match the csv to 1e-4 on every layer. Any failure stops the run.
+  Shared with test_letter_effect.py in cache_alignment.py: the cached rows are in the order of
+  measure_rbar.load_pairs' random.Random(seed).shuffle, reproduced on range(total) and verified
+  independently against the cache's example prompts; R̄ recomputed from the cache with measure_rbar's
+  float32 arithmetic must match the csv to 1e-4 on every layer. On top of that, this script checks the
+  meta against the json row by row (row_idx, pos_letter, option lengths, template_id <-> c_pos text
+  one-to-one). Any failure stops the run.
 
 Analysis 1 — pairwise-cosine decomposition (sample-size free)
   u_i = d_i/‖d_i‖. Identity: ‖mean u‖² = mean_{i,j} cos(u_i,u_j) (i=j included). The off-diagonal pairs
@@ -62,7 +57,6 @@ Outputs (in --out-dir)
 import argparse
 import json
 import math
-import random
 import sys
 from pathlib import Path
 
@@ -74,12 +68,13 @@ import pandas as pd
 import torch
 from scipy.stats import pearsonr, spearmanr
 
+from cache_alignment import load_cache, load_rbar_csv, log, shuffle_permutation, verify_permutation, crosscheck_rbar
+
 # Separator of the A/B questions written by pares/to_caa_format.py:41-43 (CAA format).
 CHOICES_SEP = "\n\nChoices:\n"
 OPTION_A = "(A) "
 OPTION_B = "\n(B) "
 
-RBAR_TOL = 1e-4          # cross-check tolerance vs rbar_results.csv (same as sweep_epsilon.crosscheck_rbar)
 IDENTITY_TOL = 1e-9      # numerical tolerance for the exact decomposition identities (float64)
 CI_PERCENTILES = (2.5, 97.5)
 # Verdict thresholds (printed with the verdict). The counterfactual R̄ is what R̄ would be if the intra-
@@ -93,36 +88,9 @@ C_INTRA, C_INTER, C_ALL, C_GLOBAL, C_CONTROL, C_GRID = '#2a78d6', '#eb6834', '#7
 C_TEXT, C_TEXT2 = '#0b0b0b', '#52514e'
 
 
-def log(msg: str = '') -> None:
-    print(msg, flush=True)
-
-
 # --------------------------------------------------------------------------------------
 # Step 0: inputs and index alignment
 # --------------------------------------------------------------------------------------
-def load_cache(path: Path) -> dict:
-    # weights_only=True is enough: the cache holds tensors, dicts, lists, ints and strs (sweep_epsilon.py:219).
-    cache = torch.load(path, map_location='cpu', weights_only=True)
-    for key in ('model', 'dataset', 'n', 'total', 'seed', 'read_token_index', 'hidden', 'layers', 'diffs',
-                'example_pos', 'example_neg'):
-        if key not in cache:
-            raise SystemExit(f"cache {path} has no key {key!r}; it is not a sweep_epsilon.py diffs cache")
-    n, h = cache['n'], cache['hidden']
-    for layer in cache['layers']:
-        d = cache['diffs'][layer]
-        if tuple(d.shape) != (n, h) or d.dtype != torch.float32:
-            raise SystemExit(f"layer {layer}: diffs are {tuple(d.shape)} {d.dtype}, expected ({n}, {h}) float32")
-    return cache
-
-
-def shuffle_permutation(total: int, n: int, seed: int) -> list[int]:
-    """perm[k] = json row index of cached row k. Replicates measure_rbar.load_pairs (measure_rbar.py:134,
-    139): random.Random(seed).shuffle over a list of length `total`, then the first n."""
-    idx = list(range(total))
-    random.Random(seed).shuffle(idx)
-    return idx[:n]
-
-
 def split_options(question: str) -> tuple[str, str]:
     """Inverse of to_caa_format.build_question: returns (text of (A), text of (B))."""
     assert question.count(CHOICES_SEP + OPTION_A) == 1 and question.count(OPTION_B) == 1, \
@@ -132,19 +100,13 @@ def split_options(question: str) -> tuple[str, str]:
     return text_a, text_b
 
 
-def verify_alignment(cache: dict, ab: list[dict], meta: list[dict], perm: list[int]) -> None:
+def verify_meta(ab: list[dict], meta: list[dict]) -> None:
+    """meta <-> json consistency in file order (to_caa_format.py:102-123 writes both from the same loop):
+    row_idx, pos_letter, option lengths, and template_id labelling the c_pos text one-to-one (independent of
+    build_pairs.TEMPLATES). SystemExit on the first inconsistency."""
     problems = []
-    total, n = cache['total'], cache['n']
-    if len(ab) != total:
-        problems.append(f"dataset json has {len(ab)} pairs but the cache says total={total}")
     if len(meta) != len(ab):
-        problems.append(f"meta has {len(meta)} rows but the dataset json has {len(ab)}")
-    if len(perm) != n or len(set(perm)) != n:
-        problems.append(f"permutation has {len(perm)} entries ({len(set(perm))} distinct), expected n={n}")
-    if problems:
-        raise SystemExit("index alignment FAILED before the content checks: " + "; ".join(problems))
-
-    # meta <-> json consistency, in file order (to_caa_format.py:102-123 writes both from the same loop)
+        raise SystemExit(f"meta has {len(meta)} rows but the dataset json has {len(ab)}")
     pos_text_by_template: dict[int, set[str]] = {}
     for i, (row, m) in enumerate(zip(ab, meta)):
         if m['row_idx'] != i:
@@ -161,77 +123,17 @@ def verify_alignment(cache: dict, ab: list[dict], meta: list[dict], perm: list[i
                             f"({m['len_pos_chars']}, {m['len_neg_chars']})")
             break
         pos_text_by_template.setdefault(m['template_id'], set()).add(pos_text)
-    # template_id must label the c_pos text of the json one-to-one (independent of build_pairs.TEMPLATES)
     multi = {t: len(v) for t, v in pos_text_by_template.items() if len(v) != 1}
     if multi:
         problems.append(f"meta template_id does not identify a single c_pos text in the json: {multi}")
     texts = [next(iter(v)) for v in pos_text_by_template.values()]
     if len(set(texts)) != len(texts):
         problems.append("two meta template_ids share the same c_pos text in the json")
-    if not problems:
-        log(f"  meta <-> json OK on {len(ab)} rows: row_idx, pos_letter, option lengths; template_id <-> c_pos text is one-to-one:")
-        for t in sorted(pos_text_by_template):
-            log(f"    template {t:2d}: {next(iter(pos_text_by_template[t]))[:80]!r}")
-
-    # Independent check of the permutation: the cache stores the formatted prompts of cached row 0
-    # (sweep_epsilon.py:211, pairs[0]); the Llama-3 chat template embeds the question verbatim (trimmed)
-    # and utils._format_llama3 asserts the string ends exactly in the answer, e.g. "(A)".
-    first = ab[perm[0]]
-    q0 = first['question'].strip()
-    ex_pos, ex_neg = cache['example_pos'], cache['example_neg']
-    if q0 not in ex_pos or q0 not in ex_neg:
-        problems.append(f"question of json row perm[0]={perm[0]} is not in the cache's example prompts: "
-                        f"the shuffle was NOT reproduced")
-    else:
-        hits = [j for j, row in enumerate(ab) if row['question'].strip() in ex_pos]
-        if hits != [perm[0]]:
-            problems.append(f"example_pos matches json rows {hits}, expected exactly [{perm[0]}]")
-    if not ex_pos.endswith(first['answer_matching_behavior']):
-        problems.append(f"example_pos ends in {ex_pos[-6:]!r}, expected {first['answer_matching_behavior']!r}")
-    if not ex_neg.endswith(first['answer_not_matching_behavior']):
-        problems.append(f"example_neg ends in {ex_neg[-6:]!r}, expected {first['answer_not_matching_behavior']!r}")
-
     if problems:
-        raise SystemExit("index alignment FAILED: " + "; ".join(problems) +
-                         ". Stopping: with a wrong mapping every number below would be plausible and wrong.")
-    log(f"  alignment OK: cached row 0 = json row {perm[0]} (author {meta[perm[0]]['author_id']}, "
-        f"question {meta[perm[0]]['question_idx']}, template {meta[perm[0]]['template_id']}, "
-        f"pos_letter {meta[perm[0]]['pos_letter']}); example prompts contain that question only and end in "
-        f"{first['answer_matching_behavior']} / {first['answer_not_matching_behavior']}")
-    log(f"  example_pos tail: {ex_pos[-70:]!r}")
-
-
-def rbar_float32_as_measure_rbar(d32: torch.Tensor) -> tuple[float, float, float]:
-    """Same arithmetic as measure_rbar.RbarAggregator / sweep_epsilon.rbar_from_cache (float32 torch)."""
-    mean_vec = torch.mean(d32, dim=0)
-    norm_mean = torch.norm(mean_vec).item()
-    mean_norm = torch.norm(d32, dim=1).mean().item()
-    return norm_mean / mean_norm, norm_mean, mean_norm
-
-
-def crosscheck_rbar(cache: dict, csv_path: Path) -> pd.DataFrame:
-    if not csv_path.is_file():
-        raise SystemExit(f"rbar csv {csv_path} not found; the R̄ cross-check is mandatory (pass --rbar-csv)")
-    csv = pd.read_csv(csv_path)
-    ref = csv[(csv['model'] == cache['model']) & (csv['dataset'] == cache['dataset'])].set_index('layer')
-    if ref.empty:
-        raise SystemExit(f"no rows for model={cache['model']!r} dataset={cache['dataset']!r} in {csv_path}")
-    worst, rows = 0.0, []
-    for layer in cache['layers']:
-        rbar, norm_mean, mean_norm = rbar_float32_as_measure_rbar(cache['diffs'][layer])
-        if layer not in ref.index:
-            raise SystemExit(f"layer {layer} is in the cache but not in {csv_path}")
-        diff = abs(rbar - float(ref.loc[layer, 'rbar']))
-        worst = max(worst, diff)
-        if int(ref.loc[layer, 'n']) != cache['n']:
-            raise SystemExit(f"layer {layer}: csv n={int(ref.loc[layer, 'n'])} != cache n={cache['n']}")
-        rows.append({'layer': layer, 'rbar_cache_f32': rbar, 'rbar_csv': float(ref.loc[layer, 'rbar']), 'abs_diff': diff})
-    if worst > RBAR_TOL:
-        bad = [r for r in rows if r['abs_diff'] > RBAR_TOL]
-        raise SystemExit(f"R̄ recomputed from the cache differs from {csv_path} by up to {worst:.2e} (> {RBAR_TOL:g}) "
-                         f"on layers {[r['layer'] for r in bad]}. The cache is not what was measured; stopping.")
-    log(f"  R̄ cross-check vs {csv_path} OK on {len(rows)} layers (max |diff| = {worst:.1e}, n = {cache['n']})")
-    return csv
+        raise SystemExit("meta <-> json check FAILED: " + "; ".join(problems) + ". Stopping.")
+    log(f"  meta <-> json OK on {len(ab)} rows: row_idx, pos_letter, option lengths; template_id <-> c_pos text is one-to-one:")
+    for t in sorted(pos_text_by_template):
+        log(f"    template {t:2d}: {next(iter(pos_text_by_template[t]))[:80]!r}")
 
 
 def check_template_counts(templates: np.ndarray, expected_k: int | None) -> np.ndarray:
@@ -494,9 +396,14 @@ def main():
         ab = json.load(f)
     with open(args.meta, encoding='utf-8') as f:
         meta = [json.loads(line) for line in f if line.strip()]
+    verify_meta(ab, meta)
     perm = shuffle_permutation(total, n, seed)
-    verify_alignment(cache, ab, meta, perm)
-    csv = crosscheck_rbar(cache, Path(args.rbar_csv))
+    verify_permutation(cache, ab, perm)
+    csv = load_rbar_csv(Path(args.rbar_csv))
+    crosscheck_rbar(cache, csv, args.rbar_csv)
+    first = meta[perm[0]]
+    log(f"  cached row 0 = json row {perm[0]}: author {first['author_id']}, question {first['question_idx']}, "
+        f"template {first['template_id']}, pos_letter {first['pos_letter']}")
 
     meta_rows = [meta[j] for j in perm]                      # meta in cached-row order
     templates = np.array([m['template_id'] for m in meta_rows])
