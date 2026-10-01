@@ -1,6 +1,7 @@
 """
-Epsilon sweep: PSA (one Gaussian mechanism per layer, basic composition) vs PSA-prima (one
-Gaussian mechanism on the concatenation of the selected layers), both measured against the clean
+Epsilon sweep: PSA (one Gaussian mechanism per layer, basic composition) vs PSA-tight (the same
+per-layer clipping, the S Gaussians composed tightly as one joint Gaussian) vs PSA-prima (one
+Gaussian mechanism on the concatenation of the selected layers), all measured against the clean
 clipped mean, on cached difference vectors.
 
 Pipeline
@@ -19,6 +20,7 @@ Scale convention (replicates run.py:44-53, priv_mean)
   normalised vector. Both mechanisms here use exactly that convention:
       PSA        v_l = mean_i clip_{C_l}(d_i^l) / C_l                + sigma_psa   * z_l   (z_l in R^h, one per layer)
       PSA-prima  v   = mean_i clip_{Cg}([d_i^{l_1} .. d_i^{l_S}]) / Cg + sigma_prima * z     (z in R^{S*h}, one draw)
+      PSA-tight  v_l = mean_i clip_{C_l}(d_i^l) / C_l                + sigma_tight * z_l   (same clipping as PSA)
   and are multiplied back by C_l / Cg so that norm ratios are in the units of the clean
   reference (cosines are scale invariant). check_priv_mean_replication() asserts numerically that
   C * priv_mean_as_in_run_py(d, z) == the PSA vector computed here.
@@ -26,6 +28,17 @@ Scale convention (replicates run.py:44-53, priv_mean)
 Privacy accounting
   PSA:        each layer gets (eps/S, delta/S)  -> (eps, delta) by basic composition.
   PSA-prima:  one mechanism at (eps, delta).
+  PSA-tight:  the S per-layer means are ONE Gaussian mechanism on their concatenation. Every row,
+              normalised per layer, has norm <= 1 in each layer, so the concatenated normalised row
+              has norm <= sqrt(S) and the concatenated mean has sensitivity sqrt(S) * (2/n). One sigma
+              sigma_tight = sigma(eps, delta, sqrt(S) * 2/n) (same calibration function as prima) is
+              applied to every layer. The Gaussian sigma is linear in the sensitivity, so in the
+              `theoretical` config (C_l = C, Cg = C sqrt(S)) C * sigma_tight = Cg * sigma_prima: tight and
+              prima add the same noise and differ only in the clipping. check_tight_equals_prima()
+              asserts that, without clipping, their cosines agree to TIGHT_TEST_TOL on every layer.
+  Gain decomposition in eps-equivalent (currency: the PSA curve): eps'_X = eps at which PSA reaches the
+  cosine of X at eps. total = eps'_prima/eps = accounting (eps'_tight/eps, PSA -> tight) x clipping
+  (eps'_prima/eps'_tight, tight -> prima), exact product when neither is censored.
   sigma is calibrated with the analytic Gaussian mechanism (Balle & Wang 2018) by default, or with
   the classical formula sigma = (2/n) sqrt(2 ln(1.25/delta)) / eps (--calibration classical, the
   paper's convention, only a valid guarantee for eps < 1).
@@ -35,19 +48,23 @@ Clip configs (c_global_mode x c_level)
                the per-layer norms ||d_i^l|| pooled over the sweep layers, or a fixed number.
   percentile:  C_l = pNN of ||d_i^l|| per layer, Cg = pNN of the concatenated norms ||D_i||.
                (fixed levels are skipped in this mode.)
+  pNN levels are percentiles of D_priv itself (not DP): every output marks them
+  "exploratorio (percentiles de D_priv)". Fixed levels (default 2 4 8 16 20; run.py's C is 20) are
+  data-independent.
   The clean reference of a config is the per-layer clipped mean at that config's C_l (no noise).
 
 Seeds are paired: seed k draws one standard normal z_k in R^{S*h} (torch.Generator, CPU, float64)
-that is shared by both mechanisms, all epsilons and all clip configs, so the PSA-prima minus PSA
-difference can be tested as a paired difference.
+that is shared by the three mechanisms, all epsilons and all clip configs, so every pairwise
+difference (tight - PSA, prima - tight, prima - PSA) can be tested as a paired difference.
 
     python sweep_epsilon.py --out-dir sweep_1b
     python sweep_epsilon.py --out-dir sweep_1b --layers 11 12 13 14 15 --c-levels p50 20
     python sweep_epsilon.py --out-dir sweep_1b --calibration classical --n-seeds 50
+    python sweep_epsilon.py --out-dir sweep_1b_bw_7-11 --layers 7 8 9 10 11 --require-cache   # diffs/ -> ../sweep_1b/diffs
 
 Outputs (in --out-dir): sweep_results.csv (per seed), sweep_summary.csv (over seeds),
-sweep_separation.csv, sweep_gain.csv, sweep_correlation.csv, clip_config.csv, norm_stats.csv,
-sigma_table.csv, sweep_answers.txt, PNG plots, diffs/<dataset>.pt.
+sweep_separation.csv, sweep_delta_cos_by_layer.csv, sweep_gain.csv, sweep_correlation.csv,
+clip_config.csv, norm_stats.csv, sigma_table.csv, sweep_answers.txt, PNG plots, diffs/<dataset>.pt.
 """
 import argparse
 import math
@@ -69,9 +86,15 @@ from scipy.stats import norm as normal_dist, pearsonr, spearmanr, t as t_dist
 from measure_rbar import DEFAULT_DATASETS, OWN_DATASET, READ_TOKEN_INDEX, SERIES_COLORS, load_pairs
 from utils import make_dataset, make_pos_neg_pair, diagnose_read_token_index, device
 
-MECHANISMS = ['psa', 'prima']
-MECH_COLOR = {'psa': '#2a78d6', 'prima': '#eb6834'}        # categorical slots 1 and 2
-MECH_LABEL = {'psa': 'PSA (per layer, basic composition)', 'prima': "PSA-prima (concatenated)"}
+MECHANISMS = ['psa', 'tight', 'prima']
+MECH_COLOR = {'psa': '#2a78d6', 'prima': '#eb6834', 'tight': '#1baf7a'}   # categorical slots 1, 2, 3
+MECH_LABEL = {'psa': 'PSA (per layer, basic composition)', 'prima': "PSA-prima (concatenated)",
+              'tight': 'PSA-tight (per-layer clip, joint Gaussian)'}
+MECH_SHORT = {'psa': 'PSA', 'prima': 'PSA-prima', 'tight': 'PSA-tight'}
+PAIRS = [('tight', 'psa'), ('prima', 'tight'), ('prima', 'psa')]   # (a, b): paired difference a - b
+TIGHT_TEST_C = 20.0     # run.py's C (run.py:23; its --clip flag is parsed but never passed, run.py:144-149)
+TIGHT_TEST_TOL = 1e-6   # |cos(tight) - cos(prima)| without clipping, every layer / seed / eps
+EXPLORATORY_NOTE = 'exploratorio (percentiles de D_priv)'
 PSEUDO_LAYERS = ['mean', 'concat']  # rows aggregated over the sweep layers
 RESULT_COLUMNS = ['model', 'dataset', 'mechanism', 'c_global_mode', 'c_level', 'epsilon', 'seed',
                   'layer', 'cosine', 'norm_ratio']
@@ -125,11 +148,21 @@ class Accountant:
     def sigma_prima(self, eps_total: float) -> float:
         return CALIBRATIONS[self.calibration](eps_total, self.delta, self.sens)
 
+    def sigma_tight(self, eps_total: float) -> float:
+        """One Gaussian on the S per-layer normalised means: sensitivity sqrt(S) * sens, same calibration
+        function as prima (Balle-Wang under --calibration analytic)."""
+        return CALIBRATIONS[self.calibration](eps_total, self.delta, math.sqrt(self.S) * self.sens)
+
+    def sigma(self, mech: str, eps_total: float) -> float:
+        return {'psa': self.sigma_psa, 'tight': self.sigma_tight, 'prima': self.sigma_prima}[mech](eps_total)
+
     def eps_equivalent_theory(self, eps_total: float) -> float:
         """eps' such that PSA at eps' has the same per-coordinate noise std as PSA-prima at eps in
         the `theoretical` config (C_l = C, Cg = C sqrt(S)): sigma_psa(eps') = sqrt(S) sigma_prima(eps).
         The theoretical eps-equivalent gain is eps'/eps (constant 2.38 for S=5 under the classical
-        formula, eps-dependent under the analytic one)."""
+        formula, eps-dependent under the analytic one). Since sigma is linear in the sensitivity,
+        sqrt(S) sigma_prima(eps) = sigma_tight(eps): this is also the theoretical ACCOUNTING gain
+        (PSA -> tight) in both clip modes, because tight and PSA share the bounds C_l."""
         target = math.sqrt(self.S) * self.sigma_prima(eps_total)
         g = lambda e: self.sigma_psa(e) - target
         lo, hi = eps_total * 1.0001, eps_total * 1000.0
@@ -141,13 +174,15 @@ class Accountant:
 def sigma_table(acc: Accountant, epsilons: list[float]) -> pd.DataFrame:
     rows = []
     for eps in epsilons:
-        s_psa, s_prima = acc.sigma_psa(eps), acc.sigma_prima(eps)
+        s_psa, s_prima, s_tight = acc.sigma_psa(eps), acc.sigma_prima(eps), acc.sigma_tight(eps)
         rows.append({
             'n': acc.n, 'calibration': acc.calibration, 'epsilon': eps,
             'eps_layer': eps / acc.S, 'delta_layer': acc.delta / acc.S,
-            'sigma_psa': s_psa, 'sigma_prima': s_prima,
+            'sigma_psa': s_psa, 'sigma_prima': s_prima, 'sigma_tight': s_tight,
             'sigma_psa_over_sqrtS_sigma_prima': s_psa / (math.sqrt(acc.S) * s_prima),
-            'eps_equiv_gain_theory': acc.eps_equivalent_theory(eps) / eps,
+            'sigma_tight_over_sqrtS_sigma_prima': s_tight / (math.sqrt(acc.S) * s_prima),   # 1 up to the root-finder tolerance
+            'sigma_psa_over_sigma_tight': s_psa / s_tight,
+            'eps_equiv_gain_theory': acc.eps_equivalent_theory(eps) / eps,   # = theoretical accounting gain
             'delta_real_psa_layer_classical': gaussian_delta(eps / acc.S, sigma_classical(eps / acc.S, acc.delta / acc.S, acc.sens), acc.sens),
             'delta_real_prima_classical': gaussian_delta(eps, sigma_classical(eps, acc.delta, acc.sens), acc.sens),
         })
@@ -301,6 +336,54 @@ def check_priv_mean_replication(d_layer: torch.Tensor, C: float, sigma: float) -
     print(f"  priv_mean replication check OK (C={C:.4g}, sigma={sigma:.4g}, max |diff| = {err:.1e})")
 
 
+def noisy_vectors(m_mech: torch.Tensor, bound: np.ndarray, sigma: float, Z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """V = m + bound_l * sigma * z (original units, the normalised mechanism multiplied back by its bound).
+    Returns (V (K, S, h), per-layer noise std s (S,)). Used by the sweep and by check_tight_equals_prima."""
+    s = torch.tensor(bound * sigma, dtype=torch.float64)
+    return m_mech[None] + s[None, :, None] * Z, s
+
+
+def check_tight_equals_prima(d: torch.Tensor, Z: torch.Tensor, epsilons: list[float], acc: 'Accountant', name: str) -> None:
+    """theoretical/C20 without clipping: tight (bound C per layer, sigma_tight) and prima (bound C sqrt(S),
+    sigma_prima) add the same noise to the same (unclipped) mean, so their cosines against it must agree to
+    TIGHT_TEST_TOL on every layer, seed and eps. SystemExit otherwise."""
+    S = d.shape[1]
+    C, Cg = TIGHT_TEST_C, TIGHT_TEST_C * math.sqrt(S)
+    m = d.mean(dim=0)                                          # no clipping: the same noiseless vector for both
+    frac = float((d.norm(dim=2) > C).double().mean())           # informative: what C20 WOULD clip per layer
+    frac_cat = float((d.reshape(d.shape[0], -1).norm(dim=1) > Cg).double().mean())
+    worst_cos, worst_std = 0.0, 0.0
+    per_layer = np.zeros(S)
+    for eps in epsilons:
+        V_t, s_t = noisy_vectors(m, np.full(S, C), acc.sigma_tight(eps), Z)
+        V_p, s_p = noisy_vectors(m, np.full(S, Cg), acc.sigma_prima(eps), Z)
+        worst_std = max(worst_std, float(((s_t - s_p).abs() / s_p).max()))
+        diff = (cosine(V_t, m[None]) - cosine(V_p, m[None])).abs()   # (K, S)
+        per_layer = np.maximum(per_layer, diff.max(dim=0).values.numpy())
+        worst_cos = max(worst_cos, float(diff.max()))
+    if worst_cos > TIGHT_TEST_TOL:
+        raise SystemExit(
+            f"[{name}] TEST tight == prima FAILED: max |cos(tight) - cos(prima)| = {worst_cos:.3e} > {TIGHT_TEST_TOL:g} "
+            f"(per layer {np.array2string(per_layer, precision=2)}), max relative noise-std gap {worst_std:.3e}. Without clipping "
+            f"the two differ only through C*sigma_tight vs C*sqrt(S)*sigma_prima; a gap means sigma_tight is not "
+            f"sigma(eps, delta, sqrt(S)*sens) with the same calibration as prima, or the bounds/draws differ. Stopping.")
+    print(f"  TEST tight == prima (theoretical/C{C:g}, no clipping, {Z.shape[0]} paired seeds, {len(epsilons)} eps): OK | "
+          f"max |cos diff| per layer {np.array2string(per_layer, precision=2)} (tol {TIGHT_TEST_TOL:g}) | max relative "
+          f"noise-std gap {worst_std:.1e} | C={C:g} would clip {100 * frac:.1f}% of per-layer rows, Cg={Cg:.1f} "
+          f"{100 * frac_cat:.1f}% of concatenated rows")
+
+
+def level_note(level: str) -> str:
+    return EXPLORATORY_NOTE if level.startswith('p') else 'fijo'
+
+
+def add_level_note(df: pd.DataFrame) -> pd.DataFrame:
+    if 'c_level' in df.columns and len(df):
+        df = df.copy()
+        df.insert(df.columns.get_loc('c_level') + 1, 'c_level_note', df['c_level'].astype(str).map(level_note))
+    return df
+
+
 @dataclass
 class ClipConfig:
     mode: str            # 'theoretical' | 'percentile'
@@ -392,9 +475,10 @@ def sweep_dataset(cache: dict, layers: list[int], modes: list[str], levels: list
         m_prima = clipped_cat.mean(dim=0).reshape(S, h)
         ref = m_psa                                    # clean reference of this config
         ref_norm = ref.norm(dim=1)                     # (S,)
-        m = {'psa': m_psa, 'prima': m_prima}
-        frac = {'psa': frac_psa, 'prima': np.full(S, frac_prima)}
-        bound = {'psa': cfg.C_layer, 'prima': np.full(S, cfg.Cg)}
+        # tight clips exactly like PSA (same C_l); only its sigma differs
+        m = {'psa': m_psa, 'tight': m_psa, 'prima': m_prima}
+        frac = {'psa': frac_psa, 'tight': frac_psa, 'prima': np.full(S, frac_prima)}
+        bound = {'psa': cfg.C_layer, 'tight': cfg.C_layer, 'prima': np.full(S, cfg.Cg)}
         cos_noiseless = {mech: cosine(m[mech], ref).numpy() for mech in MECHANISMS}
         cos_noiseless_cat = {mech: cosine(m[mech].reshape(-1), ref.reshape(-1)).item() for mech in MECHANISMS}
         cos_ref_raw = cosine(ref, m_raw).numpy()
@@ -418,10 +502,9 @@ def sweep_dataset(cache: dict, layers: list[int], modes: list[str], levels: list
 
         # ---- noise ---------------------------------------------------------------
         for eps in epsilons:
-            sig = {'psa': acc.sigma_psa(eps), 'prima': acc.sigma_prima(eps)}
+            sig = {mech: acc.sigma(mech, eps) for mech in MECHANISMS}
             for mech in MECHANISMS:
-                s = torch.tensor(bound[mech] * sig[mech], dtype=torch.float64)       # (S,) per-coordinate noise std, original units
-                V = m[mech][None] + s[None, :, None] * Z                              # (K, S, h)
+                V, s = noisy_vectors(m[mech], bound[mech], sig[mech], Z)              # (K, S, h), (S,) noise std in original units
                 cos_l = cosine(V, ref[None]).numpy()                                  # (K, S)
                 nr_l = (V.norm(dim=2) / ref_norm[None]).numpy()                       # (K, S)
                 cos_cat = cosine(V.reshape(K, -1), ref.reshape(1, -1)).numpy()        # (K,)
@@ -450,7 +533,8 @@ def sweep_dataset(cache: dict, layers: list[int], modes: list[str], levels: list
                 pred_rows.append({**base, 'layer': 'concat', 'sigma': sig[mech], 'clip_bound': cfg.Cg if mech == 'prima' else float('nan'),
                                   'noise_std_orig': float(np.sqrt(np.mean(s.numpy() ** 2))), 'frac_clipped': frac_prima if mech == 'prima' else float('nan'),
                                   'cos_pred': pred_cos_cat, 'norm_ratio_pred': pred_nr_cat, 'n': n})
-        print(f"  [{cfg.mode:11s} {cfg.level:5s}] C_layer={np.round(cfg.C_layer, 2).tolist()} Cg={cfg.Cg:.2f} | "
+        print(f"  [{cfg.mode:11s} {cfg.level:5s}{' ' + EXPLORATORY_NOTE if cfg.level.startswith('p') else ''}] "
+              f"C_layer={np.round(cfg.C_layer, 2).tolist()} Cg={cfg.Cg:.2f} | "
               f"frac clipped psa={np.round(frac_psa, 2).tolist()} prima={frac_prima:.2f} | "
               f"prima noiseless cos vs ref (mean over layers)={cos_noiseless['prima'].mean():.4f} | "
               f"ref vs unclipped mean cos={cos_ref_raw.mean():.4f}")
@@ -495,6 +579,20 @@ def separation(results: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
     return sep
 
 
+def delta_cos_by_layer(results: pd.DataFrame) -> pd.DataFrame:
+    """Paired (same seed => same z) difference a - b of the cosine for every pair in PAIRS, on every sweep
+    layer and on the 'mean' / 'concat' pseudo-layers, with a t 95% interval over seeds."""
+    keys = ['dataset', 'c_global_mode', 'c_level', 'epsilon', 'layer']
+    wide = results.pivot_table(index=keys + ['seed'], columns='mechanism', values='cosine', sort=False).reset_index()
+    rows = []
+    for key, sub in wide.groupby(keys, sort=False):
+        for a, b in PAIRS:
+            m, s, hw = ci95((sub[a] - sub[b]).to_numpy())
+            rows.append(dict(zip(keys, key), pair=f"{a}-{b}", n_seeds=len(sub), diff_mean=m, diff_std=s,
+                             diff_ci95_lo=m - hw, diff_ci95_hi=m + hw, paired_separated=bool((m - hw > 0) or (m + hw < 0))))
+    return pd.DataFrame(rows)
+
+
 def eps_equivalent_empirical(eps_grid: np.ndarray, cos_psa: np.ndarray, target: float) -> tuple[float, str]:
     """eps' at which the PSA curve reaches `target` (linear interpolation in log eps). Returns
     (eps', censor) with censor '>' if PSA never reaches it inside the grid, '<' if PSA is already
@@ -515,6 +613,7 @@ def gains(summary: pd.DataFrame, accountants: dict[str, Accountant]) -> pd.DataF
     for (name, mode, level), sub in sm.groupby(['dataset', 'c_global_mode', 'c_level'], sort=False):
         psa = sub[sub['mechanism'] == 'psa'].sort_values('epsilon')
         prima = sub[sub['mechanism'] == 'prima'].sort_values('epsilon')
+        tight = sub[sub['mechanism'] == 'tight'].set_index('epsilon')['cos_mean']
         eps_grid, cos_psa = psa['epsilon'].to_numpy(), psa['cos_mean'].to_numpy()
         non_monotone = int((np.diff(cos_psa) < 0).sum())
         acc = accountants[name]
@@ -522,7 +621,9 @@ def gains(summary: pd.DataFrame, accountants: dict[str, Accountant]) -> pd.DataF
         for _, row in prima.iterrows():
             eps = row['epsilon']
             eps_eq, censor = eps_equivalent_empirical(eps_grid, cos_psa, row['cos_mean'])
-            theory = acc.eps_equivalent_theory(eps) / eps if mode == 'theoretical' else float('nan')
+            eps_eq_t, censor_t = eps_equivalent_empirical(eps_grid, cos_psa, float(tight.loc[eps]))
+            theory_acc = acc.eps_equivalent_theory(eps) / eps     # PSA -> tight, valid in both clip modes
+            theory = theory_acc if mode == 'theoretical' else float('nan')
             # per-layer noise-std ratio PSA/prima at this eps (the noise-only reference in both modes)
             pl = pl_cfg[pl_cfg['epsilon'] == eps]
             r_l = pl[pl['mechanism'] == 'psa'].sort_values('layer')['noise_std_orig'].to_numpy() / \
@@ -530,6 +631,11 @@ def gains(summary: pd.DataFrame, accountants: dict[str, Accountant]) -> pd.DataF
             rows.append({'dataset': name, 'c_global_mode': mode, 'c_level': level, 'epsilon': eps,
                          'cos_prima': row['cos_mean'], 'eps_equiv_psa': eps_eq, 'censor': censor,
                          'gain_empirical': eps_eq / eps, 'gain_theory_eps_equiv': theory,
+                         # decomposition, currency = the PSA curve: total = accounting x clipping
+                         'cos_tight': float(tight.loc[eps]), 'eps_equiv_psa_for_tight': eps_eq_t, 'censor_tight': censor_t,
+                         'gain_accounting': eps_eq_t / eps, 'gain_accounting_theory': theory_acc,
+                         'gain_clipping': eps_eq / eps_eq_t,
+                         'decomposition_censored': bool(censor or censor_t),
                          'noise_std_ratio_min': r_l.min(), 'noise_std_ratio_max': r_l.max(),
                          'psa_curve_non_monotone_steps': non_monotone})
     return pd.DataFrame(rows)
@@ -583,7 +689,7 @@ def _panel_cos_vs_eps(ax, summary: pd.DataFrame, name: str, mode: str, level: st
         ax.fill_between(s['epsilon'], s['cos_ci95_lo'], s['cos_ci95_hi'], color=MECH_COLOR[mech], alpha=0.18, linewidth=0)
         ax.plot(s['epsilon'], s['cos_mean'], color=MECH_COLOR[mech], marker='o', markersize=4, linewidth=2, label=MECH_LABEL[mech])
         ax.plot(s['epsilon'], s['cos_pred'], color=MECH_COLOR[mech], linestyle='--', linewidth=1, alpha=0.8,
-                label=f"{'PSA' if mech == 'psa' else 'PSA-prima'} analytic prediction")
+                label=f"{MECH_SHORT[mech]} analytic prediction")
     ax.set_xscale('log')
     ax.set_xticks(epsilons)
     ax.set_xticklabels([f"{e:g}" for e in epsilons], fontsize=8)
@@ -606,8 +712,9 @@ def plot_cos_vs_eps(summary: pd.DataFrame, datasets: list[str], n_by_dataset: di
     for ax in axes[:, 0]:
         ax.set_ylabel('cos(v_priv, v_clean), mean over layers')
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=4, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle(f"{header} — clip config {mode}/{level}", fontsize=11)
+    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle(f"{header} — clip config {mode}/{level}" + (f" — {EXPLORATORY_NOTE}" if level.startswith('p') else ''),
+                 fontsize=11)
     fig.tight_layout(rect=(0, 0.04, 1, 0.97))
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -624,13 +731,14 @@ def plot_dataset_big(summary: pd.DataFrame, name: str, n: int, modes: list[str],
                 ax.set_visible(False)
                 continue
             level = levels_by_mode[mode][j]
-            _panel_cos_vs_eps(ax, summary, name, mode, level, epsilons, f"{mode} / {level}")
+            _panel_cos_vs_eps(ax, summary, name, mode, level, epsilons,
+                              f"{mode} / {level}" + (" (exploratorio)" if level.startswith('p') else ''))
             ax.set_xlabel('ε total (log)')
             if j == 0:
                 ax.set_ylabel('cos(v_priv, v_clean), mean over layers')
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=4, frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.005))
-    fig.suptitle(f"{header} — {name} (n={n})", fontsize=13)
+    fig.legend(handles, labels, loc='lower center', ncol=3, frameon=False, fontsize=10, bbox_to_anchor=(0.5, -0.005))
+    fig.suptitle(f"{header} — {name} (n={n}) — pNN = {EXPLORATORY_NOTE}", fontsize=13)
     fig.tight_layout(rect=(0, 0.04, 1, 0.97))
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -664,7 +772,7 @@ def plot_scatter(points: pd.DataFrame, stats: pd.DataFrame, datasets: list[str],
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='none', alpha=0.85))
             ax.set_xlabel(xlabel)
             ax.set_ylabel(f"1 − cos at ε={eps_used:g} ({mechanism})")
-            ax.set_title(f"{mode} / {level}", fontsize=10)
+            ax.set_title(f"{mode} / {level}" + (f" — {EXPLORATORY_NOTE}" if level.startswith('p') else ''), fontsize=10)
             _style(ax)
     fig.suptitle(f"{header}\nR̄ / ‖mean diff‖ at the peak-R̄ layer vs cosine drop at ε={eps_used:g} ({mechanism}); hollow = n < {n_full}",
                  fontsize=11)
@@ -677,7 +785,8 @@ def plot_scatter(points: pd.DataFrame, stats: pd.DataFrame, datasets: list[str],
 # Answers
 # --------------------------------------------------------------------------------------
 def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFrame, summary: pd.DataFrame,
-                  sigmas: pd.DataFrame, args, S: int, h: int, config_order: list[tuple[str, str]], path: Path) -> None:
+                  sigmas: pd.DataFrame, delta: pd.DataFrame, args, S: int, h: int, config_order: list[tuple[str, str]],
+                  path: Path) -> None:
     lines = []
     P = lines.append
 
@@ -686,11 +795,19 @@ def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFram
             sub = df[(df['c_global_mode'] == mode) & (df['c_level'] == level)]
             if len(sub):
                 yield (mode, level), sub
+
+    def tag(mode: str, level: str) -> str:
+        return f"[{mode}/{level}{' — ' + EXPLORATORY_NOTE if level.startswith('p') else ''}]"
+
+    def gmean(x: pd.Series) -> float:
+        return float(np.exp(np.log(x.to_numpy(dtype=float)).mean())) if len(x) else float('nan')
     P("=" * 100)
     P("RESPUESTAS")
     P("=" * 100)
     P(f"modelo {args.model} | capas {sorted(args.layers)} (S={S}) | calibración {args.calibration} | δ_total={args.delta:g} | "
       f"{args.n_seeds} semillas apareadas | ε ∈ {sorted(args.epsilons)}")
+    P(f"mecanismos: PSA (σ por capa a (ε/S, δ/S)), PSA-tight (mismo recorte por capa, un solo gaussiano con sensibilidad √S·2/n "
+      f"a (ε, δ)), PSA-prima (recorte conjunto, un gaussiano a (ε, δ)). Niveles pNN = {EXPLORATORY_NOTE}; niveles numéricos = C fijo.")
     P("")
     # ---- chequeo de escala ---------------------------------------------------------
     sm_ = summary[summary['layer'] == 'mean']
@@ -708,7 +825,7 @@ def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFram
     P("   Criterio A (apareado): IC 95% t de la diferencia prima−PSA del coseno medio por capas excluye 0 (misma semilla ⇒ mismo z).")
     P("   Criterio B (marginal): las bandas IC 95% de los dos mecanismos no se solapan.")
     for (mode, level), sub in by_config(sep):
-        P(f"   [{mode}/{level}]")
+        P(f"   {tag(mode, level)}")
         any_sep = False
         for eps, se in sub.groupby('epsilon', sort=True):
             a_prima = se[se['paired_separated'] & (se['winner'] == 'prima')]['dataset'].tolist()
@@ -740,7 +857,7 @@ def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFram
     for (mode, level), sub in by_config(gain):
         ok = sub[sub['censor'] == '']
         cen = sub[sub['censor'] != '']
-        line = f"   [{mode}/{level}] "
+        line = f"   {tag(mode, level)} "
         if len(ok):
             line += (f"ganancia empírica: mediana {ok['gain_empirical'].median():.2f}, rango [{ok['gain_empirical'].min():.2f}, "
                      f"{ok['gain_empirical'].max():.2f}] ({len(ok)} puntos dataset×ε no censurados)")
@@ -762,7 +879,7 @@ def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFram
     P(f"3. ¿Correlaciona R̄ con la degradación (1 − cos a ε={args.corr_eps:g}, {args.corr_mechanism}, media por capas)?")
     for _, sub in by_config(corr_stats):
         r = sub.iloc[0]
-        P(f"   [{r['c_global_mode']}/{r['c_level']}] n={int(r['n_points'])} datasets | "
+        P(f"   {tag(r['c_global_mode'], r['c_level'])} n={int(r['n_points'])} datasets | "
           f"R̄:  Pearson r={r['pearson_r_rbar_peak']:+.2f} (p={r['pearson_p_rbar_peak']:.2g}), Spearman ρ={r['spearman_rho_rbar_peak']:+.2f} (p={r['spearman_p_rbar_peak']:.2g}) | "
           f"‖mean diff‖: Pearson r={r['pearson_r_norm_mean_peak']:+.2f} (p={r['pearson_p_norm_mean_peak']:.2g}), "
           f"Spearman ρ={r['spearman_rho_norm_mean_peak']:+.2f} (p={r['spearman_p_norm_mean_peak']:.2g})")
@@ -773,6 +890,49 @@ def write_answers(sep: pd.DataFrame, gain: pd.DataFrame, corr_stats: pd.DataFram
       f"para p<0.05; un p-valor aquí no distingue una relación real de dos datasets extremos. Además (a) la predicción analítica dice que lo que manda es "
       f"‖mean diff‖ = R̄·mean‖diff‖ (no R̄ solo), y (b) los datasets con n<{args.n_samples} tienen más ruido al mismo ε (σ ∝ 1/n), lo que confunde la relación. "
       f"Tómalo como exploratorio, no como evidencia.")
+    P("")
+    # ---- 4. descomposición --------------------------------------------------------------
+    P("4. Descomposición de la ganancia en ε equivalente (moneda común: la curva de PSA, media por capas).")
+    P("   ε'_X = ε al que PSA alcanza el coseno de X en ε. total = ε'_prima/ε = contabilidad (ε'_tight/ε, PSA→tight) × "
+      "recorte (ε'_prima/ε'_tight, tight→prima).")
+    P("   Resúmenes con media GEOMÉTRICA sobre los puntos dataset×ε donde ni prima ni tight están censurados, así el producto "
+      "cierra exacto: total = contabilidad × recorte. Participación = log(contabilidad)/log(total).")
+    P("   Teoría de contabilidad = ε-equivalente de ruido σ_psa(ε') = σ_tight(ε) (vale en ambos modos: tight y PSA comparten C_l). "
+      "En modo theoretical tight y prima tienen el MISMO ruido, así que el recorte teórico por ruido es 1 y todo lo que se aleje "
+      "de 1 es geometría del recorte (por capa a C vs conjunto a C√S). En modo percentile el 'recorte' también incluye el "
+      "reparto del ruido entre capas (C_l por capa vs Cg común).")
+    for (mode, level), sub in by_config(gain):
+        ok = sub[~sub['decomposition_censored']]
+        n_cen = int(sub['decomposition_censored'].sum())
+        if not len(ok):
+            P(f"   {tag(mode, level)} sin puntos no censurados ({n_cen} censurados)")
+            continue
+        g_tot, g_acc, g_clip = gmean(ok['gain_empirical']), gmean(ok['gain_accounting']), gmean(ok['gain_clipping'])
+        share = math.log(g_acc) / math.log(g_tot) if abs(math.log(g_tot)) > 1e-12 else float('nan')
+        P(f"   {tag(mode, level)} total {g_tot:.3f} = contabilidad {g_acc:.3f} × recorte {g_clip:.3f} | participación de la "
+          f"contabilidad {100 * share:.0f}% | contabilidad teórica {ok['gain_accounting_theory'].min():.3f}..{ok['gain_accounting_theory'].max():.3f} | "
+          f"{len(ok)} puntos, {n_cen} censurados")
+        for eps, se in ok.groupby('epsilon', sort=True):
+            P(f"      ε={eps:<6g} total {gmean(se['gain_empirical']):.3f} = contabilidad {gmean(se['gain_accounting']):.3f} × "
+              f"recorte {gmean(se['gain_clipping']):.3f} (teoría contabilidad {se['gain_accounting_theory'].iloc[0]:.3f}; "
+              f"{len(se)} datasets)")
+    P("")
+    # ---- 5. Δcos por capa ----------------------------------------------------------------
+    P("5. Δcos por capa (diferencia apareada, media sobre semillas y luego sobre datasets): tight−PSA / prima−tight / prima−PSA.")
+    P("   [k/N] = datasets en los que el IC 95% apareado de prima−tight excluye 0. Detalle por dataset en sweep_delta_cos_by_layer.csv.")
+    layer_order = [l for l in delta['layer'].unique() if l not in PSEUDO_LAYERS] + [l for l in PSEUDO_LAYERS if l in set(delta['layer'])]
+    for (mode, level), sub in by_config(delta):
+        P(f"   {tag(mode, level)}")
+        for eps, se in sub.groupby('epsilon', sort=True):
+            parts = []
+            for l in layer_order:
+                sl = se[se['layer'] == l]
+                v = {p: sl.loc[sl['pair'] == p, 'diff_mean'].mean() for p in ('tight-psa', 'prima-tight', 'prima-psa')}
+                pt = sl[sl['pair'] == 'prima-tight']
+                lab = f"L{l}" if l not in PSEUDO_LAYERS else l
+                parts.append(f"{lab} {v['tight-psa']:+.4f}/{v['prima-tight']:+.4f}/{v['prima-psa']:+.4f} "
+                             f"[{int(pt['paired_separated'].sum())}/{len(pt)}]")
+            P(f"      ε={eps:<6g} " + " | ".join(parts))
     text = "\n".join(lines)
     print(text)
     path.write_text(text, encoding='utf-8')
@@ -791,8 +951,8 @@ def main():
     parser.add_argument("--epsilons", type=float, nargs='+', default=[0.25, 0.5, 1, 2, 4, 8, 16, 32], help="total epsilon grid")
     parser.add_argument("--delta", type=float, default=1e-5, help="total delta")
     parser.add_argument("--c-modes", nargs='+', default=['theoretical', 'percentile'], choices=['theoretical', 'percentile'])
-    parser.add_argument("--c-levels", nargs='+', default=['p10', 'p25', 'p50', 'p90', '20'],
-                        help="pNN = percentile of the observed norms, a number = fixed C")
+    parser.add_argument("--c-levels", nargs='+', default=['p10', 'p25', 'p50', 'p90', '2', '4', '8', '16', '20'],
+                        help=f"pNN = percentile of the observed norms ({EXPLORATORY_NOTE}), a number = fixed C")
     parser.add_argument("--calibration", default='analytic', choices=list(CALIBRATIONS))
     parser.add_argument("--n-samples", type=int, default=400)
     parser.add_argument("--seed", type=int, default=42, help="dataset shuffle seed (same as run.py / measure_rbar.py)")
@@ -803,6 +963,8 @@ def main():
     parser.add_argument("--corr-eps", type=float, default=1.0, help="epsilon at which the cosine drop of the scatter is taken")
     parser.add_argument("--corr-mechanism", default='psa', choices=MECHANISMS)
     parser.add_argument("--force-extract", action='store_true')
+    parser.add_argument("--require-cache", action='store_true',
+                        help="stop (SystemExit) instead of loading the model when a dataset has no cache in <out-dir>/diffs")
     parser.add_argument("--skip-plots", action='store_true')
     args = parser.parse_args()
 
@@ -854,6 +1016,9 @@ def main():
     # ---- caches / model ------------------------------------------------------------------
     need = [d for d in args.datasets if args.force_extract or not cache_path(out_dir, d).is_file()]
     model = tokenizer = None
+    if need and args.require_cache:
+        raise SystemExit(f"--require-cache: no cache for {need} in {(out_dir / 'diffs').resolve()} (or --force-extract given); "
+                         f"the model would be loaded. Check the diffs symlink. Stopping.")
     if need:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from steering_vectors import get_num_matching_layers, guess_and_enhance_layer_config
@@ -900,6 +1065,10 @@ def main():
             rb = rbar_from_cache(cache)
             crosscheck_rbar(rb, rbar_csv, args.model)
             check_priv_mean_replication(cache['diffs'][layers[0]], C=20.0, sigma=0.02)
+            # mandatory test before the sweep; it raises SystemExit, which `except Exception` does not catch,
+            # so a failure stops the whole run instead of skipping this dataset
+            check_tight_equals_prima(torch.stack([cache['diffs'][l] for l in layers], dim=1).double(), Z, epsilons,
+                                     Accountant(args.calibration, cache['n'], args.delta, S), name)
             res, preds, clip, norms, acc = sweep_dataset(cache, layers, args.c_modes, levels, epsilons, Z, seeds,
                                                          args.calibration, args.delta, args.model)
         except Exception:
@@ -926,19 +1095,22 @@ def main():
     # ---- aggregation --------------------------------------------------------------------
     results = pd.DataFrame(all_results, columns=RESULT_COLUMNS)
     preds = pd.DataFrame(all_preds)
+    add_level_note(results).to_csv(results_path, index=False)   # final rewrite with the c_level_note column
     summary = summarize(results, preds)
-    summary.to_csv(out_dir / 'sweep_summary.csv', index=False)
-    pd.DataFrame(all_clip).to_csv(out_dir / 'clip_config.csv', index=False)
+    add_level_note(summary).to_csv(out_dir / 'sweep_summary.csv', index=False)
+    add_level_note(pd.DataFrame(all_clip)).to_csv(out_dir / 'clip_config.csv', index=False)
     pd.DataFrame(all_norms).to_csv(out_dir / 'norm_stats.csv', index=False)
     rbar_all = pd.concat(all_rbar, ignore_index=True)
     rbar_all.to_csv(out_dir / 'rbar_from_cache.csv', index=False)
     sep = separation(results, summary)
-    sep.to_csv(out_dir / 'sweep_separation.csv', index=False)
+    add_level_note(sep).to_csv(out_dir / 'sweep_separation.csv', index=False)
+    delta = delta_cos_by_layer(results)
+    add_level_note(delta).to_csv(out_dir / 'sweep_delta_cos_by_layer.csv', index=False)
     gain = gains(summary, accountants)
-    gain.to_csv(out_dir / 'sweep_gain.csv', index=False)
+    add_level_note(gain).to_csv(out_dir / 'sweep_gain.csv', index=False)
     points, corr_stats = correlation(summary, rbar_all, args.corr_eps, args.corr_mechanism)
-    points.to_csv(out_dir / 'sweep_correlation_points.csv', index=False)
-    corr_stats.to_csv(out_dir / 'sweep_correlation.csv', index=False)
+    add_level_note(points).to_csv(out_dir / 'sweep_correlation_points.csv', index=False)
+    add_level_note(corr_stats).to_csv(out_dir / 'sweep_correlation.csv', index=False)
 
     # ---- plots -----------------------------------------------------------------------------
     datasets_done = [d for d in args.datasets if d in n_by_dataset and d not in errors]
@@ -967,8 +1139,8 @@ def main():
         print(sm.to_string(index=False))
     print("=" * 100)
     config_order = [(m, l) for m in args.c_modes for l in levels_by_mode[m]]
-    write_answers(sep, gain, corr_stats, summary, st, args, S, int(Z.shape[2]), config_order, out_dir / 'sweep_answers.txt')
-    print(f"\nwrote {results_path}, sweep_summary.csv, sweep_separation.csv, sweep_gain.csv, sweep_correlation.csv, "
+    write_answers(sep, gain, corr_stats, summary, st, delta, args, S, int(Z.shape[2]), config_order, out_dir / 'sweep_answers.txt')
+    print(f"\nwrote {results_path}, sweep_summary.csv, sweep_separation.csv, sweep_delta_cos_by_layer.csv, sweep_gain.csv, sweep_correlation.csv, "
           f"clip_config.csv, norm_stats.csv, sigma_table.csv, sweep_answers.txt in {out_dir}")
     if errors:
         print("\nDATASETS THAT FAILED:")
