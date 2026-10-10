@@ -61,6 +61,8 @@ difference (tight - PSA, prima - tight, prima - PSA) can be tested as a paired d
     python sweep_epsilon.py --out-dir sweep_1b --layers 11 12 13 14 15 --c-levels p50 20
     python sweep_epsilon.py --out-dir sweep_1b --calibration classical --n-seeds 50
     python sweep_epsilon.py --out-dir sweep_1b_bw_7-11 --layers 7 8 9 10 11 --require-cache   # diffs/ -> ../sweep_1b/diffs
+    python sweep_epsilon.py --model open-unlearning/tofu_Llama-3.2-3B-Instruct_full --out-dir sweep_3b \
+        --rbar-csv resultados_rbar_3b/rbar_results.csv --extract-only   # caches only (all layers), no sweep
 
 Outputs (in --out-dir): sweep_results.csv (per seed), sweep_summary.csv (over seeds),
 sweep_separation.csv, sweep_delta_cos_by_layer.csv, sweep_gain.csv, sweep_correlation.csv,
@@ -965,8 +967,13 @@ def main():
     parser.add_argument("--force-extract", action='store_true')
     parser.add_argument("--require-cache", action='store_true',
                         help="stop (SystemExit) instead of loading the model when a dataset has no cache in <out-dir>/diffs")
+    parser.add_argument("--extract-only", action='store_true',
+                        help="write the missing <out-dir>/diffs caches (all layers), cross-check R̄ against --rbar-csv and stop: "
+                             "no sigma table, no sweep, no plots")
     parser.add_argument("--skip-plots", action='store_true')
     args = parser.parse_args()
+    if args.extract_only and args.require_cache:
+        parser.error("--extract-only and --require-cache contradict each other")
 
     out_dir = Path(args.out_dir)
     (out_dir / 'diffs').mkdir(parents=True, exist_ok=True)
@@ -986,25 +993,29 @@ def main():
     print(f"n_samples    : {args.n_samples} | shuffle seed {args.seed} | noise seeds {seeds[0]}..{seeds[-1]} (paired)")
     print(f"datasets     : {args.datasets}")
     print(f"out dir      : {out_dir.resolve()}")
+    if args.extract_only:
+        print("mode         : --extract-only (caches + R̄ cross-check, no sweep)")
     print("=" * 100)
 
     # ---- calibration sanity print ------------------------------------------------------
-    acc_ref = Accountant(args.calibration, args.n_samples, args.delta, S)
-    k = 2.0 * math.sqrt(2.0 * math.log(1.25 / args.delta))
-    eps_c = k / (args.n_samples * 0.02)
-    eps_a = brentq(lambda e: gaussian_delta(e, 0.02, 2.0 / args.n_samples) - args.delta, 1e-3, 1e3)
-    print(f"paper noise_multiplier=0.02 at n={args.n_samples}, delta={args.delta:g}: eps per layer = {eps_c:.4f} (classical) / "
-          f"{eps_a:.4f} (analytic); basic composition over {S} layers: eps_total = {S * eps_c:.3f} (classical), delta_total = {S * args.delta:g}")
-    st = sigma_table(acc_ref, epsilons)
-    print(f"sigma table for n={args.n_samples} (sigma = run.py noise_multiplier scale; datasets with fewer pairs get larger sigma):")
-    with pd.option_context('display.width', 250, 'display.float_format', '{:.6g}'.format):
-        print(st.to_string(index=False))
-    if args.calibration == 'classical':
-        bad = st[(st['delta_real_psa_layer_classical'] > args.delta / S) | (st['delta_real_prima_classical'] > args.delta)]
-        if len(bad):
-            print(f"WARNING: with the classical formula, eps in {bad['epsilon'].tolist()} are NOT (eps, delta)-DP "
-                  f"(real delta above target); the relative comparison is still consistent.")
-    st.to_csv(out_dir / 'sigma_table.csv', index=False)
+    st = None
+    if not args.extract_only:
+        acc_ref = Accountant(args.calibration, args.n_samples, args.delta, S)
+        k = 2.0 * math.sqrt(2.0 * math.log(1.25 / args.delta))
+        eps_c = k / (args.n_samples * 0.02)
+        eps_a = brentq(lambda e: gaussian_delta(e, 0.02, 2.0 / args.n_samples) - args.delta, 1e-3, 1e3)
+        print(f"paper noise_multiplier=0.02 at n={args.n_samples}, delta={args.delta:g}: eps per layer = {eps_c:.4f} (classical) / "
+              f"{eps_a:.4f} (analytic); basic composition over {S} layers: eps_total = {S * eps_c:.3f} (classical), delta_total = {S * args.delta:g}")
+        st = sigma_table(acc_ref, epsilons)
+        print(f"sigma table for n={args.n_samples} (sigma = run.py noise_multiplier scale; datasets with fewer pairs get larger sigma):")
+        with pd.option_context('display.width', 250, 'display.float_format', '{:.6g}'.format):
+            print(st.to_string(index=False))
+        if args.calibration == 'classical':
+            bad = st[(st['delta_real_psa_layer_classical'] > args.delta / S) | (st['delta_real_prima_classical'] > args.delta)]
+            if len(bad):
+                print(f"WARNING: with the classical formula, eps in {bad['epsilon'].tolist()} are NOT (eps, delta)-DP "
+                      f"(real delta above target); the relative comparison is still consistent.")
+        st.to_csv(out_dir / 'sigma_table.csv', index=False)
 
     rbar_csv = None
     if Path(args.rbar_csv).is_file():
@@ -1056,6 +1067,11 @@ def main():
             if cache['n'] < args.n_samples:
                 print(f"[{name}] WARNING: only {cache['n']} pairs (< {args.n_samples}); sigma is calibrated with n={cache['n']}, "
                       f"i.e. {args.n_samples / cache['n']:.2f}x more noise than an n={args.n_samples} dataset at the same epsilon.")
+            if args.extract_only:
+                crosscheck_rbar(rbar_from_cache(cache), rbar_csv, args.model)
+                print(f"[{name}] cache OK ({len(cache['layers'])} layers, n={cache['n']}, hidden {cache['hidden']}) "
+                      f"in {time.time() - t0:.0f}s")
+                continue
             if Z is None:
                 h = cache['hidden']
                 Z = torch.stack([torch.randn(S, h, generator=torch.Generator(device='cpu').manual_seed(s), dtype=torch.float64)
@@ -1085,6 +1101,17 @@ def main():
         print(f"[{name}] done in {time.time() - t0:.0f}s | {len(res)} rows | partial results -> {results_path}")
 
     print("=" * 100)
+    if args.extract_only:
+        done = [d for d in args.datasets if d in n_by_dataset and d not in errors]
+        print(f"--extract-only: caches in {(out_dir / 'diffs').resolve()} for {done} "
+              f"(extracted in this run: {[d for d in need if d in done]})")
+        if errors:
+            print("\nDATASETS THAT FAILED:")
+            for name, tb in errors.items():
+                print(f"  - {name}: {tb.strip().splitlines()[-1]}")
+            (out_dir / 'extract_errors.log').write_text("\n\n".join(f"### {n}\n{tb}" for n, tb in errors.items()))
+            raise SystemExit(f"--extract-only: {len(errors)} dataset(s) failed, see {out_dir / 'extract_errors.log'}")
+        return
     if not all_results:
         raise SystemExit("no dataset succeeded; nothing to report")
     if model is not None:
