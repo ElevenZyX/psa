@@ -47,6 +47,12 @@ LLAMA3_END_TOKEN = '<|eot_id|>'
 # below do `tokenizer(input, ...)`), which prepends a second BOS. Stripping the template's copy
 # leaves exactly one BOS in the tokenized input. Set to False to keep the raw template output.
 LLAMA3_STRIP_TEMPLATE_BOS = True
+# Date written in the "Today Date:" line of the Llama-3 system header. Without date_string the Llama-3.2
+# template uses strftime_now("%d %b %Y") (the day the script runs), so the prompts and every activation change
+# from one day to the next; the Llama-3.1 template falls back to "26 Jul 2024". Passing this constant to every
+# apply_chat_template call makes 3.2 prompts reproducible and leaves 3.1 prompts unchanged.
+CHAT_DATE = "26 Jul 2024"
+TODAY_DATE_PREFIX = "Today Date: "
 
 MWEData = list[dict[str, str]]
 
@@ -56,13 +62,15 @@ def is_llama3_tokenizer(tokenizer) -> bool:
     return 'llama-3' in name or 'llama3' in name
 
 
-def _format_llama3(tokenizer, question: str, answer: str) -> str:
-    """ Llama-3 prompt ending exactly in `answer` (e.g. "(A)"), with no closing <|eot_id|> """
+def _format_llama3(tokenizer, question: str, answer: str, date_string: str | None = CHAT_DATE) -> str:
+    """ Llama-3 prompt ending exactly in `answer` (e.g. "(A)"), with no closing <|eot_id|>.
+    date_string=None omits the kwarg (template default); only check_prompt_format --selftest uses that. """
+    date_kw = {} if date_string is None else {'date_string': date_string}
     text = tokenizer.apply_chat_template([
         {'role': 'system', 'content': SYS_PROMPT},
         {'role': 'user', 'content': question},
         {'role': 'assistant', 'content': answer}
-    ], tokenize=False, add_generation_prompt=False)
+    ], tokenize=False, add_generation_prompt=False, **date_kw)
     idx = text.rfind(LLAMA3_END_TOKEN)
     assert idx != -1, f"Llama-3 chat template output has no {LLAMA3_END_TOKEN!r}: {text[-80:]!r}"
     text = text[:idx]
@@ -77,11 +85,24 @@ def _format_llama3(tokenizer, question: str, answer: str) -> str:
     return text
 
 
+def check_today_date(prompt: str, label: str = '') -> None:
+    """ Prints the "Today Date:" line(s) of a Llama-3 prompt; SystemExit unless there is exactly one and it is CHAT_DATE. """
+    lines = [l for l in prompt.split('\n') if l.startswith(TODAY_DATE_PREFIX)]
+    print(f"--- chat date {label}: {lines!r} (expected {TODAY_DATE_PREFIX + CHAT_DATE!r})")
+    if lines != [TODAY_DATE_PREFIX + CHAT_DATE]:
+        raise SystemExit(f"{label}prompt has Today Date lines {lines!r}, expected exactly [{TODAY_DATE_PREFIX + CHAT_DATE!r}]: "
+                         f"the chat template did not receive date_string=CHAT_DATE, so the prompt depends on the day "
+                         f"it runs. Stopping.")
+
+
 def diagnose_read_token_index(prompt: str, tokenizer, read_token_index: int = -2,
                               expected_letter: str | None = None, label: str = '') -> bool:
     """ Prints the last tokens of `prompt` and checks that the token at `read_token_index`
     contains the answer letter (A/B by default). Returns False if it does not, which means
-    `read_token_index` must be adjusted for this tokenizer. """
+    `read_token_index` must be adjusted for this tokenizer. For a Llama-3 tokenizer it also prints the
+    "Today Date:" line and raises SystemExit unless it is exactly CHAT_DATE. """
+    if is_llama3_tokenizer(tokenizer):
+        check_today_date(prompt, label)
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     print(f"--- read-token diagnostic {label}(read_token_index={read_token_index}, "
           f"{len(ids)} tokens without special tokens) ---")
@@ -126,14 +147,14 @@ def make_pos_neg_pair(mwe_data: MWEData, tokenizer) -> tuple[str, str]:
             {'role': 'system', 'content': 'You are a helpful, honest assistant.'},
             {'role': 'user', 'content': mwe_data['question']},
             {'role': 'assistant', 'content': mwe_data['answer_matching_behavior']}
-        ], tokenize=False, add_generation_prompt=False)
+        ], tokenize=False, add_generation_prompt=False, date_string=CHAT_DATE)
         idx = pos.rfind(end_token)
         pos = pos[:idx] 
         neg = tokenizer.apply_chat_template([
             {'role': 'system', 'content': 'You are a helpful, honest assistant.'},
             {'role': 'user', 'content': mwe_data['question']},
             {'role': 'assistant', 'content': mwe_data['answer_not_matching_behavior']}
-        ], tokenize=False, add_generation_prompt=False)
+        ], tokenize=False, add_generation_prompt=False, date_string=CHAT_DATE)
         idx = neg.rfind(end_token)
         neg = neg[:idx] 
 
@@ -143,14 +164,14 @@ def make_pos_neg_pair(mwe_data: MWEData, tokenizer) -> tuple[str, str]:
             # {'role': 'system', 'content': 'You are a helpful, honest assistant.'},
             {'role': 'user', 'content': mwe_data['question']},
             {'role': 'assistant', 'content': mwe_data['answer_matching_behavior']}
-        ], tokenize=False, add_generation_prompt=False)
+        ], tokenize=False, add_generation_prompt=False, date_string=CHAT_DATE)
         idx = pos.rfind(end_token)
         pos = pos[:idx] 
         neg = tokenizer.apply_chat_template([
             # {'role': 'system', 'content': 'You are a helpful, honest assistant.'},
             {'role': 'user', 'content': mwe_data['question']},
             {'role': 'assistant', 'content': mwe_data['answer_not_matching_behavior']}
-        ], tokenize=False, add_generation_prompt=False)
+        ], tokenize=False, add_generation_prompt=False, date_string=CHAT_DATE)
         idx = neg.rfind(end_token)
         neg = neg[:idx] 
     return pos, neg
@@ -247,6 +268,7 @@ def generate_text_with_template(prompt, model, tokenizer, temperature=0.6, max_n
             "role": "user", "content": prompt 
         }
     ]
-    inps = tokenizer.apply_chat_template(prompt_dict, return_tensors='pt', add_generation_prompt=True).to(device)
+    inps = tokenizer.apply_chat_template(prompt_dict, return_tensors='pt', add_generation_prompt=True,
+                                         date_string=CHAT_DATE).to(device)
     outs = model.generate(inps, temperature=temperature, max_new_tokens=max_new_tokens, do_sample=do_sample)
     return tokenizer.decode(outs[0])
