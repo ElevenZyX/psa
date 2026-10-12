@@ -61,7 +61,7 @@ MODELS = {
 }
 # (default window, {dataset: exception}) — Diego's expected step-1 result, asserted on the real csv
 EXPECTED_WINDOWS = {
-    '1b': ((7, 11), {'refusal': (8, 12)}),
+    '1b': ((7, 11), {}),   # refusal was 8-12 before R̄ was re-measured with utils.CHAT_DATE fixed
     '3b': ((11, 15), {'sycophancy': (10, 14)}),
     '8b': ((12, 16), {'hallucination': (13, 17), 'refusal': (13, 17)}),
 }
@@ -316,6 +316,31 @@ def select_c(curves: pd.DataFrame, model: str, S: int = WINDOW_SIZE, tie_tol: fl
     return pd.DataFrame(rows)
 
 
+SEL_COLUMNS = ['model', 'dataset', 'ventana', 'C', 'Cg', 'empate', 'C_empatados', 'C_eval', 'Cg_eval', 'recorte_total']
+
+
+def add_tie_eval(sel: pd.DataFrame, clip: pd.DataFrame, S: int = WINDOW_SIZE) -> pd.DataFrame:
+    """C_eval / Cg_eval / recorte_total. recorte_total = True when the tie is mathematical: every tied C clips 100% of
+    the rows of every dataset of others(k) on every layer of W_k (PSA, per layer; same criterion as the resumen note),
+    so the privatised direction does not depend on C. Then C_eval = the smallest tied C, Cg_eval = C_eval * sqrt(S).
+    Any other row (no tie, or a tie that is not mathematical): C_eval / Cg_eval empty, recorte_total = False.
+    C, Cg, empate and C_empatados are not touched."""
+    psa_clip = clip[clip['mechanism'] == 'psa'].groupby(['ventana', 'dataset', 'C'])['frac_clipped'].min()
+    c_eval, total = [], []
+    for _, s in sel.iterrows():
+        full = False
+        if s['empate']:
+            tied = [float(c) for c in s['C_empatados'].split()]
+            full = all(psa_clip.loc[(s['ventana'], j, c)] >= 1.0 for j in others(s['dataset']) for c in tied)
+        total.append(full)
+        c_eval.append(min(tied) if full else float('nan'))
+    out = sel.copy()
+    out['C_eval'] = c_eval
+    out['Cg_eval'] = out['C_eval'] * math.sqrt(S)
+    out['recorte_total'] = total
+    return out
+
+
 def selected_fidelity(results: pd.DataFrame, sel: pd.DataFrame) -> pd.DataFrame:
     """PSA and PSA-prima on k itself, in W_k, at C_k (every tied C if there is a tie): mean over seeds of the layer-mean
     cosine and the paired (same z) difference prima - PSA with a t 95% interval."""
@@ -432,7 +457,7 @@ def run(args) -> None:
                               args.model, real_checks=True)
     summary = summarize(results)
     curves = selection_curves(summary, window_of, grid, args.select_eps)
-    sel = select_c(curves, args.model)
+    sel = add_tie_eval(select_c(curves, args.model), clip)
     fid = selected_fidelity(results, sel)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -442,15 +467,60 @@ def run(args) -> None:
     summary.to_csv(out_dir / 'sweep_c_summary.csv', index=False)
     clip.to_csv(out_dir / 'clip_stats.csv', index=False)
     curves.to_csv(out_dir / 'c_selection_curves.csv', index=False)
-    sel[['model', 'dataset', 'ventana', 'C', 'Cg', 'empate', 'C_empatados']].to_csv(out_dir / 'c_selection.csv', index=False)
+    sel[SEL_COLUMNS].to_csv(out_dir / 'c_selection.csv', index=False)
     fid.to_csv(out_dir / 'c_selected_fidelity.csv', index=False)
     log("=" * 100)
     log("STEP 5 — c_selection.csv")
-    log(sel[['model', 'dataset', 'ventana', 'C', 'Cg', 'empate', 'C_empatados']].to_string(index=False))
+    log(sel[SEL_COLUMNS].to_string(index=False))
     text = write_resumen(args, wt, gc, sel, curves, clip, fid, {d: c['n'] for d, c in caches.items()}, grid)
     (out_dir / 'resumen.txt').write_text(text + "\n", encoding='utf-8')
     log(f"\nwrote windows.csv, grid_check.csv, sweep_c_results.csv, sweep_c_summary.csv, clip_stats.csv, c_selection.csv, "
         f"c_selection_curves.csv, c_selected_fidelity.csv, resumen.txt in {out_dir}")
+
+
+def recompute_selection(d: Path, select_eps: list[float], c_grid: list[float]) -> None:
+    """Rewrite <d>/c_selection.csv with SEL_COLUMNS from the saved sweep_c_summary.csv, clip_stats.csv and windows.csv,
+    without sweeping. Stops (nothing written) unless the recomputed F_k(C) equal c_selection_curves.csv and the
+    columns C, Cg, empate, C_empatados (and model, dataset, ventana) equal the existing c_selection.csv."""
+    log("=" * 100)
+    log(f"--recompute-selection {d}")
+    files = {f: d / f for f in ('sweep_c_summary.csv', 'clip_stats.csv', 'windows.csv', 'c_selection_curves.csv',
+                                'c_selection.csv')}
+    missing = [str(p) for p in files.values() if not p.is_file()]
+    if missing:
+        raise SystemExit(f"missing {missing}")
+    summary = pd.read_csv(files['sweep_c_summary.csv'])
+    summary['layer'] = summary['layer'].astype(str)
+    clip = pd.read_csv(files['clip_stats.csv'])
+    wt = pd.read_csv(files['windows.csv'])
+    old_curves = pd.read_csv(files['c_selection_curves.csv'])
+    old = pd.read_csv(files['c_selection.csv'], keep_default_na=False, na_values=[''])
+    models = summary['model'].unique()
+    if len(models) != 1:
+        raise SystemExit(f"{d}: sweep_c_summary.csv has models {list(models)}, expected one")
+    grid = sorted(float(c) for c in summary['C'].unique())
+    if grid != sorted(float(c) for c in c_grid):
+        raise SystemExit(f"{d}: C grid in sweep_c_summary.csv {grid} != --c-grid {sorted(c_grid)}")
+    window_of = dict(zip(wt['dataset'], wt['ventana']))
+    curves = selection_curves(summary, window_of, grid, select_eps)
+    cmp = curves.merge(old_curves, on=['dataset', 'ventana', 'C'], suffixes=('', '_saved'), validate='one_to_one')
+    if len(cmp) != len(curves) or len(cmp) != len(old_curves) or (cmp['F'] - cmp['F_saved']).abs().max() > 1e-12:
+        raise SystemExit(f"{d}: F_k(C) recomputed from sweep_c_summary.csv does not match c_selection_curves.csv "
+                         f"(--select-eps {select_eps} different from the original run?). Nothing written.")
+    sel = add_tie_eval(select_c(curves, models[0]), clip)
+    same = (len(old) == len(sel)
+            and (old[['model', 'dataset', 'ventana']].astype(str).to_numpy() == sel[['model', 'dataset', 'ventana']].astype(str).to_numpy()).all()
+            and (old['empate'].astype(bool).to_numpy() == sel['empate'].to_numpy()).all()
+            and (old['C_empatados'].fillna('').astype(str).to_numpy() == sel['C_empatados'].astype(str).to_numpy()).all()
+            and all(np.allclose(old[c].to_numpy(float), sel[c].to_numpy(float), rtol=0, atol=1e-12, equal_nan=True)
+                    for c in ('C', 'Cg')))
+    if not same:
+        raise SystemExit(f"{d}: the recomputed C / Cg / empate / C_empatados differ from the existing c_selection.csv. "
+                         f"Nothing written.")
+    sel[SEL_COLUMNS].to_csv(files['c_selection.csv'], index=False)
+    log(f"  F_k(C) match c_selection_curves.csv; C, Cg, empate, C_empatados unchanged; added C_eval, Cg_eval, recorte_total")
+    log(sel[SEL_COLUMNS].to_string(index=False))
+    log(f"  wrote {files['c_selection.csv']} ({int(sel['recorte_total'].sum())} empate(s) matemático(s))")
 
 
 def table(dirs: list[str]) -> None:
@@ -656,6 +726,17 @@ def selftest(args) -> None:
     tie_curves.loc[(tie_curves['dataset'] == k0) & (tie_curves['C'].isin([4.0, 6.0])), 'F'] = top + 0.01
     st_ = select_c(tie_curves, 'synthetic').set_index('dataset')
     assert st_.loc[k0, 'empate'] and np.isnan(st_.loc[k0, 'C']) and st_.loc[k0, 'C_empatados'] == '4 6', st_.loc[k0]
+    ev = add_tie_eval(st_.reset_index(), clip).set_index('dataset')            # synthetic clip: C=4, 6 do not clip everything
+    assert not ev.loc[k0, 'recorte_total'] and np.isnan(ev.loc[k0, 'C_eval']), ev.loc[k0]
+    full_clip = clip.copy()
+    full_clip.loc[full_clip['C'].isin([4.0, 6.0]), 'frac_clipped'] = 1.0
+    ev = add_tie_eval(st_.reset_index(), full_clip).set_index('dataset')
+    assert ev.loc[k0, 'recorte_total'] and ev.loc[k0, 'C_eval'] == 4.0 and abs(ev.loc[k0, 'Cg_eval'] - 4 * math.sqrt(5)) < 1e-12
+    assert np.isnan(ev.loc[k0, 'C']) and ev.loc[k0, 'empate'] and ev.loc[k0, 'C_empatados'] == '4 6'
+    k1 = DEFAULT_DATASETS[1]
+    assert not ev.loc[k1, 'empate'] and not ev.loc[k1, 'recorte_total'] and np.isnan(ev.loc[k1, 'C_eval'])
+    log("  OK: C_eval = smallest tied C and recorte_total = True only when every tied C clips 100% of the rows of "
+        "others(k) on every layer; C / empate / C_empatados unchanged")
     d_big =torch.stack([caches['hallucination']['diffs'][l] for l in range(2, 7)], dim=1).double() * 100   # every norm >> 3
     cos2, st2 = sweep_one(d_big, Z, Accountant('analytic', d_big.shape[0], args.delta, S), [2.0, 3.0], eps_grid)
     assert all(s['frac_clipped'] == 1.0 for s in st2)
@@ -693,6 +774,9 @@ def main():
                         help="accepted for symmetry with sweep_epsilon.py; always in force (this script never loads a model)")
     parser.add_argument("--check-only", action='store_true', help="steps 1-2 only, from the R̄ csv; writes nothing")
     parser.add_argument("--table", nargs='+', metavar='DIR', help="print the models x datasets table from these output dirs")
+    parser.add_argument("--recompute-selection", nargs='+', metavar='DIR',
+                        help="rewrite only c_selection.csv (adds C_eval, Cg_eval, recorte_total) from the saved results "
+                             "of these sweep_c_* dirs, without sweeping")
     parser.add_argument("--selftest", action='store_true', help="synthetic data in memory, asserts, writes nothing")
     args = parser.parse_args()
     if args.selftest:
@@ -700,6 +784,10 @@ def main():
         return
     if args.table:
         table(args.table)
+        return
+    if args.recompute_selection:
+        for d in args.recompute_selection:
+            recompute_selection(Path(d), args.select_eps, args.c_grid)
         return
     if args.model_tag is None and (args.model is None or args.rbar_csv is None):
         parser.error("give --model-tag, or --model and --rbar-csv (and --diffs-dir / --out-dir)")
