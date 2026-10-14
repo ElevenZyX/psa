@@ -320,20 +320,16 @@ SEL_COLUMNS = ['model', 'dataset', 'ventana', 'C', 'Cg', 'empate', 'C_empatados'
 
 
 def add_tie_eval(sel: pd.DataFrame, clip: pd.DataFrame, S: int = WINDOW_SIZE) -> pd.DataFrame:
-    """C_eval / Cg_eval / recorte_total. recorte_total = True when the tie is mathematical: every tied C clips 100% of
-    the rows of every dataset of others(k) on every layer of W_k (PSA, per layer; same criterion as the resumen note),
-    so the privatised direction does not depend on C. Then C_eval = the smallest tied C, Cg_eval = C_eval * sqrt(S).
-    Any other row (no tie, or a tie that is not mathematical): C_eval / Cg_eval empty, recorte_total = False.
-    C, Cg, empate and C_empatados are not touched."""
-    psa_clip = clip[clip['mechanism'] == 'psa'].groupby(['ventana', 'dataset', 'C'])['frac_clipped'].min()
+    """C_eval / Cg_eval / recorte_total, filled on every row. C_eval = the smallest tied C if there is a tie, else the
+    chosen C; Cg_eval = C_eval * sqrt(S). recorte_total = True when, at C_eval, every row of every dataset of others(k)
+    is clipped (frac_clipped == 1, clip_stats) on every layer of W_k, in both mechanisms (PSA at C_eval, PSA-prima at
+    Cg_eval). C, Cg, empate and C_empatados are not touched."""
+    min_clip = clip.groupby(['ventana', 'dataset', 'C', 'mechanism'])['frac_clipped'].min()
     c_eval, total = [], []
     for _, s in sel.iterrows():
-        full = False
-        if s['empate']:
-            tied = [float(c) for c in s['C_empatados'].split()]
-            full = all(psa_clip.loc[(s['ventana'], j, c)] >= 1.0 for j in others(s['dataset']) for c in tied)
-        total.append(full)
-        c_eval.append(min(tied) if full else float('nan'))
+        C = min(float(c) for c in s['C_empatados'].split()) if s['empate'] else float(s['C'])
+        total.append(all(min_clip.loc[(s['ventana'], j, C, mech)] == 1.0 for j in others(s['dataset']) for mech in MECHS))
+        c_eval.append(C)
     out = sel.copy()
     out['C_eval'] = c_eval
     out['Cg_eval'] = out['C_eval'] * math.sqrt(S)
@@ -520,7 +516,7 @@ def recompute_selection(d: Path, select_eps: list[float], c_grid: list[float]) -
     sel[SEL_COLUMNS].to_csv(files['c_selection.csv'], index=False)
     log(f"  F_k(C) match c_selection_curves.csv; C, Cg, empate, C_empatados unchanged; added C_eval, Cg_eval, recorte_total")
     log(sel[SEL_COLUMNS].to_string(index=False))
-    log(f"  wrote {files['c_selection.csv']} ({int(sel['recorte_total'].sum())} empate(s) matemático(s))")
+    log(f"  wrote {files['c_selection.csv']} ({int(sel['recorte_total'].sum())} fila(s) con recorte_total=True)")
 
 
 def table(dirs: list[str]) -> None:
@@ -726,17 +722,25 @@ def selftest(args) -> None:
     tie_curves.loc[(tie_curves['dataset'] == k0) & (tie_curves['C'].isin([4.0, 6.0])), 'F'] = top + 0.01
     st_ = select_c(tie_curves, 'synthetic').set_index('dataset')
     assert st_.loc[k0, 'empate'] and np.isnan(st_.loc[k0, 'C']) and st_.loc[k0, 'C_empatados'] == '4 6', st_.loc[k0]
-    ev = add_tie_eval(st_.reset_index(), clip).set_index('dataset')            # synthetic clip: C=4, 6 do not clip everything
-    assert not ev.loc[k0, 'recorte_total'] and np.isnan(ev.loc[k0, 'C_eval']), ev.loc[k0]
+    ev = add_tie_eval(st_.reset_index(), clip).set_index('dataset')            # synthetic clip: C=4 does not clip everything
+    assert not ev.loc[k0, 'recorte_total'] and ev.loc[k0, 'C_eval'] == 4.0, ev.loc[k0]
+    k1 = DEFAULT_DATASETS[1]
+    C1 = st_.loc[k1, 'C']
+    assert not ev.loc[k1, 'empate'] and ev.loc[k1, 'C_eval'] == C1 and abs(ev.loc[k1, 'Cg_eval'] - C1 * math.sqrt(5)) < 1e-12
+    assert not ev.loc[k1, 'recorte_total'], ev.loc[k1]
     full_clip = clip.copy()
-    full_clip.loc[full_clip['C'].isin([4.0, 6.0]), 'frac_clipped'] = 1.0
+    full_clip.loc[full_clip['C'] == 4.0, 'frac_clipped'] = 1.0
     ev = add_tie_eval(st_.reset_index(), full_clip).set_index('dataset')
     assert ev.loc[k0, 'recorte_total'] and ev.loc[k0, 'C_eval'] == 4.0 and abs(ev.loc[k0, 'Cg_eval'] - 4 * math.sqrt(5)) < 1e-12
     assert np.isnan(ev.loc[k0, 'C']) and ev.loc[k0, 'empate'] and ev.loc[k0, 'C_empatados'] == '4 6'
-    k1 = DEFAULT_DATASETS[1]
-    assert not ev.loc[k1, 'empate'] and not ev.loc[k1, 'recorte_total'] and np.isnan(ev.loc[k1, 'C_eval'])
-    log("  OK: C_eval = smallest tied C and recorte_total = True only when every tied C clips 100% of the rows of "
-        "others(k) on every layer; C / empate / C_empatados unchanged")
+    hit = (clip['C'] == C1) & (clip['ventana'] == st_.loc[k1, 'ventana']) & clip['dataset'].isin(others(k1))
+    one_mech = clip.copy()
+    one_mech.loc[hit & (clip['mechanism'] == 'psa'), 'frac_clipped'] = 1.0
+    assert not add_tie_eval(st_.reset_index(), one_mech).set_index('dataset').loc[k1, 'recorte_total']
+    one_mech.loc[hit, 'frac_clipped'] = 1.0
+    assert add_tie_eval(st_.reset_index(), one_mech).set_index('dataset').loc[k1, 'recorte_total']
+    log("  OK: C_eval = smallest tied C (tie) or the chosen C (no tie), Cg_eval = C_eval·√5; recorte_total = True only "
+        "when C_eval clips 100% of the rows of others(k) on every layer in both mechanisms; C / empate / C_empatados unchanged")
     d_big =torch.stack([caches['hallucination']['diffs'][l] for l in range(2, 7)], dim=1).double() * 100   # every norm >> 3
     cos2, st2 = sweep_one(d_big, Z, Accountant('analytic', d_big.shape[0], args.delta, S), [2.0, 3.0], eps_grid)
     assert all(s['frac_clipped'] == 1.0 for s in st2)
