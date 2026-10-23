@@ -572,13 +572,18 @@ def seed_everything(seed: int = 0) -> None:
 
 
 def versions() -> dict:
+    """Library versions recorded in the protocol (config.json of the job and of every condition). fsspec is the one
+    package setup_tesis_ou.sh allows to differ from tesis (ALLOWED_CHANGES), so it is recorded explicitly."""
     v = library_versions()
-    for name in ('datasets', 'tokenizers', 'accelerate', 'huggingface-hub', 'hydra-core', 'omegaconf', 'rouge-score',
-                 'nltk', 'lm-eval', 'scikit-learn'):
-        try:
-            v[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            v[name] = None
+    for name in ('datasets', 'fsspec', 'pyarrow', 'tokenizers', 'accelerate', 'huggingface-hub', 'hydra-core', 'omegaconf',
+                 'rouge-score', 'nltk', 'lm-eval', 'scikit-learn'):
+        v[name] = None
+        for cand in (name, name.replace('-', '_')):
+            try:
+                v[name] = importlib.metadata.version(cand)
+                break
+            except importlib.metadata.PackageNotFoundError:
+                pass
     return v
 
 
