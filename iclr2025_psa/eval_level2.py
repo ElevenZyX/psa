@@ -6,7 +6,7 @@ Protocol (approved by Diego, 2026-10-22):
   * fp32 + sdpa: the models are loaded by utils.get_model_and_tokenizer(load_bfloat=False), as in the levels 1-3. Never bf16
     or flash_attention_2 (OU's model configs ask for both; their model_args are not used).
   * OU at commit OU_COMMIT, used from source through sys.path (--ou-dir, default ../open-unlearning), never pip-installed
-    (OU pins transformers 5.x; steering-vectors 0.12.1 requires transformers < 5). OU's `trainer` package is never imported
+    (OU pins transformers 5.x; steering-vectors 0.12.x requires transformers < 5). OU's `trainer` package is never imported
     (it pulls deepspeed); its seed_everything is replicated below. The OU config is composed with hydra.compose
     (experiment=eval/tofu/default, model=<OU config of the model>, eval.tofu.batch_size=--batch-size); every locuslab/TOFU
     dataset node (23) is pinned at TOFU_REVISION.
@@ -35,7 +35,7 @@ PSA-1G sin ruido, and PSA / PSA-1G for every ε in --epsilons (1 4 8) and seed i
 noiseless vectors), --lams (default 1), --seeds, --epsilons.
 
 Checks (all abort unless marked AVISO): OU checkout at OU_COMMIT with a clean tree, OU packages imported from --ou-dir,
-transformers < 5, steering_vectors 0.12.1, TF32 off; c_selection / caches / R̄ (as level 3); --level3-config (optional):
+transformers < 5, steering_vectors STEERING_VECTORS_VERSION, TF32 off; c_selection / caches / R̄ (as level 3); --level3-config (optional):
 the tofu-forget10 inputs of the level 3 are the same files; composed suite (7 metrics, 23 TOFU nodes, generation args,
 batch); prompts (above); model snapshots (config._commit_hash), fp32, sdpa, GPU type == protocol; first training prompt
 rebuilt == the cache's (real models); check 4 (Mean Steering from the cache == train_steering_vector + run.py scaled_mean,
@@ -102,6 +102,7 @@ from sweep_epsilon import Accountant, check_priv_mean_replication, ci95, cosine
 # Constants
 # --------------------------------------------------------------------------------------
 OU_COMMIT = 'b29929067732c40ee4ca58d5cc1d3c11fcf37de1'
+STEERING_VECTORS_VERSION = '0.12.2'   # the one of env "tesis" on the cluster, used by level 3 (nivel3_*/config.json)
 TOFU_PATH = 'locuslab/TOFU'
 TOFU_REVISION = '324592d84ae4f482ac7249b9285c2ecdb53e3a68'
 TOFU_NODES = {'forget10_perturbed': 8, 'retain_perturbed': 4, 'real_authors_perturbed': 5, 'world_facts_perturbed': 5,
@@ -546,9 +547,9 @@ def check_environment() -> str:
     import transformers
     problems = []
     if int(transformers.__version__.split('.')[0]) >= 5:
-        problems.append(f"transformers {transformers.__version__} (steering-vectors 0.12.1 needs < 5)")
-    if steering_vectors.__version__ != '0.12.1':
-        problems.append(f"steering_vectors {steering_vectors.__version__} != 0.12.1")
+        problems.append(f"transformers {transformers.__version__} (steering-vectors {STEERING_VECTORS_VERSION} needs < 5)")
+    if steering_vectors.__version__ != STEERING_VECTORS_VERSION:
+        problems.append(f"steering_vectors {steering_vectors.__version__} != {STEERING_VECTORS_VERSION}")
     if torch.backends.cuda.matmul.allow_tf32:
         problems.append("torch.backends.cuda.matmul.allow_tf32 is True (fp32 protocol)")
     if torch.get_float32_matmul_precision() != 'highest':
