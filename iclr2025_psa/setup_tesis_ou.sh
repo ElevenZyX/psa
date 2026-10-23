@@ -326,7 +326,7 @@ for mod in (data, evals, evals.metrics):
 assert 'trainer' not in sys.modules, "open-unlearning's trainer package got imported"
 import hydra, lm_eval, rouge_score, steering_vectors, torch, transformers  # noqa: F401
 assert int(transformers.__version__.split('.')[0]) < 5, transformers.__version__
-assert steering_vectors.__version__ == '0.12.1', steering_vectors.__version__
+assert steering_vectors.__version__ == '0.12.2', steering_vectors.__version__  # = eval_level2.STEERING_VECTORS_VERSION
 print(f"    evals desde {evals.__file__}: OK")
 EOF
 
