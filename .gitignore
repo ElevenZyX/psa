@@ -137,3 +137,6 @@ dmypy.json
 # Project files
 sketch*
 iclr2025_psa/sketch*
+
+# open-unlearning clonado por iclr2025_psa/setup_tesis_ou.sh (nivel 2)
+/open-unlearning/
